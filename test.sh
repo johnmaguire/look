@@ -6,9 +6,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 # current directory, which the trap below deletes
 T=$(mktemp -d "${TMPDIR:-/tmp}/look-test.XXXXXX")
 T=$(cd "$T" && pwd -P)
-export LOOK_SOCK="$T/viewer.sock" LOOK_HISTORY="$T/history.jsonl"
-pid=
-trap 'kill $pid 2>/dev/null; rm -rf "$T"' EXIT
+export LOOK_SOCK="$T/viewer.sock" LOOK_HISTORY="$T/history.jsonl" LOOK_SESSIONS="$T/sessions"
+pid= lp= fake2=
+# Stands in for the Claude Code process and conversation the session runs under
+sleep 600 & fake=$!
+export CLAUDE_PID=$fake CLAUDE_CODE_SESSION_ID=aaaa-0001
+trap 'kill $pid $fake $fake2 $lp 2>/dev/null; rm -rf "$T"' EXIT
 cd "$T"
 
 start_viewer() {
@@ -22,6 +25,19 @@ q() { nvim --server "$LOOK_SOCK" --remote-expr "luaeval('$(printf %s "$1" | sed 
 check() { [ "$2" = "$3" ] && echo "ok   $1" || { echo "FAIL $1: got [$2] want [$3]"; exit 1; }; }
 here_line() { q 'vim.fn.expand([[%:t]]) .. [[:]] .. vim.fn.line([[.]])'; }
 records() { grep -c . "$LOOK_HISTORY"; }
+pending() { ls "$LOOK_SESSIONS/$1/pending" | wc -l | tr -d ' '; }
+# Wait until a listener holds the lock of the session whose id starts with $1
+held() {
+  for _ in $(seq 50); do
+    set -- "$1" "$(ls -d "$LOOK_SESSIONS/$1"* 2>/dev/null | head -1)"
+    [ -n "$2" ] && python3 -c 'import fcntl, sys
+f = open(sys.argv[1], "a")
+try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError: sys.exit(0)
+sys.exit(1)' "$2/lock" && return; sleep 0.1
+  done
+  echo "FAIL listener did not start"; exit 1
+}
 # Put the cursor on the history row whose record matches, then press <CR>
 enter_row() {
   q "(function()
@@ -129,3 +145,80 @@ L fx.txt:3 "to clear"
 L --clear >/dev/null
 check "clear" "$(q '#vim.api.nvim_buf_get_extmarks(vim.fn.bufnr([[fx.txt]]), -1, 0, -1, {})')" 0
 L nope.go:1 2>/dev/null && { echo "FAIL missing file accepted"; exit 1; } || echo "ok   missing file rejected"
+
+# Comments back to the session that showed the code
+sid=$(ls "$LOOK_SESSIONS")
+L fx.txt:5-6 "comment me" 2>/dev/null
+q '(function() vim.ui.input = function(_, cb) cb([[why line 5?]]) end end)()' >/dev/null
+q 'vim.cmd([[5,6LookComment]])' >/dev/null
+check "queued while not listening" "$(pending "$sid")" 1
+"$here/look.py" --listen > listen1.out
+check "listener delivers backlog" "$(head -2 listen1.out)" "look comment on $T/fx.txt:5-6:
+why line 5?"
+check "comment carries code" "$(sed -n 4p listen1.out)" "$(sed -n 5p fx.txt)"
+check "backlog cleared" "$(pending "$sid")" 0
+"$here/look.py" --listen > listen2.out & lp=$!
+held "$sid"
+check "one listener per session" "$("$here/look.py" --listen)" "already listening"
+check "no nudge while listening" "$(L fx.txt:7 2>&1)" ""
+q 'vim.cmd([[7LookComment]])' >/dev/null
+wait $lp
+check "live delivery" "$(head -1 listen2.out)" "look comment on $T/fx.txt:7-7:"
+# Another conversation looks last, so a missed tag would fall back to it
+ln -s fx.txt link.txt
+printf 'd\n' > d.txt
+CLAUDE_CODE_SESSION_ID=dddd-0004 "$here/look.py" d.txt:1 2>/dev/null
+dsid=$(ls "$LOOK_SESSIONS" | grep dddd)
+q '(function() vim.cmd([[wincmd p]]); vim.cmd.edit([[link.txt]]); vim.cmd([[2LookComment]]) end)()' >/dev/null
+check "symlinked spelling finds the tag" "$(pending "$sid") $(pending "$dsid")" "1 0"
+cp fx.txt fx.tmp && mv fx.tmp fx.txt
+q '(function() vim.cmd.edit([[fx.txt]]); vim.cmd([[3LookComment]]) end)()' >/dev/null
+check "save by rename keeps the tag" "$(pending "$sid") $(pending "$dsid")" "2 0"
+"$here/look.py" --listen >/dev/null
+TZ=Pacific/Auckland "$here/look.py" fx.txt:4 2>/dev/null
+q '(function() vim.cmd.edit([[fx.txt]]); vim.cmd([[4LookComment]]) end)()' >/dev/null
+check "session in another time zone is alive" "$(pending "$sid")" 1
+"$here/look.py" --listen >/dev/null
+seq 1 60 > long.txt
+printf 'untagged \377 byte\n' > new.txt
+q '(function() vim.cmd.edit([[new.txt]]); vim.cmd([[1LookComment]]); vim.cmd.edit([[long.txt]]); vim.cmd([[1,50LookComment]]) end)()' >/dev/null
+check "untagged file goes to the last session" "$(pending "$sid")" 2
+"$here/look.py" --listen > listen3.out
+check "non-UTF-8 code keeps the comment" "$(grep -c '^why line 5?$' listen3.out)" 2
+check "long selection says it was cut" "$(grep -c '^(first 40 of 50 lines)$' listen3.out)" 1
+q '(function() _G.Look.commenting = true end)()' >/dev/null
+check "look waits for a comment being typed" "$(L fx.txt:3 2>&1 | tail -1)" "the user is writing a comment in the viewer - try again in a moment"
+q '(function() _G.Look.commenting = false end)()' >/dev/null
+check "quickfix refused" "$(q '(function() vim.cmd([[copen]]); vim.cmd([[1LookComment]]); return vim.fn.execute([[messages]]):match([[from a file window]]) or [[]] end)()')" "from a file window"
+
+# /clear: a new conversation in the same process does not drain the old one's queue
+printf 'c\n' > c.txt
+CLAUDE_CODE_SESSION_ID=cccc-0003 "$here/look.py" c.txt:1 2>/dev/null
+q '(function() vim.cmd([[wincmd p]]); vim.cmd.edit([[fx.txt]]); vim.cmd([[5LookComment]]) end)()' >/dev/null
+csid=$(ls "$LOOK_SESSIONS" | grep cccc)
+check "comment stays with the conversation that showed the code" "$(pending "$sid") $(pending "$csid")" "1 0"
+"$here/look.py" --listen >/dev/null
+
+# Session ends: its listener leaves without taking comments and removes the
+# queue; comments on its code are refused, not sent to another session
+mkdir "$LOOK_SESSIONS/archive-2025"
+"$here/look.py" --listen > listen4.out & lp=$!
+held "$sid"
+kill $fake; wait $fake 2>/dev/null || true
+rc=0; wait $lp || rc=$?
+check "listener exits with its session" "$rc $(wc -c < listen4.out | tr -d ' ')" "1 0"
+check "ended session's queue removed" "$([ -d "$LOOK_SESSIONS/$sid" ] && echo kept || echo gone)" gone
+q '(function() vim.cmd.edit([[fx.txt]]); vim.cmd([[1LookComment]]) end)()' >/dev/null
+check "ended session refused" "$(q 'vim.fn.execute([[messages]]):match([[has ended]]) or [[]]')" "has ended"
+sleep 600 & fake=$!
+export CLAUDE_PID=$fake
+L fx.txt:2 2>/dev/null
+sid2=$(ls "$LOOK_SESSIONS" | grep "^$fake-")
+kill $fake; wait $fake 2>/dev/null || true
+sleep 600 & fake2=$!
+CLAUDE_PID=$fake2 CLAUDE_CODE_SESSION_ID=bbbb-0002 "$here/look.py" --listen >/dev/null & lp=$!
+held "$fake2-"
+for _ in $(seq 50); do [ -d "$LOOK_SESSIONS/$sid2" ] || break; sleep 0.1; done
+check "session ended without listener swept" "$([ -d "$LOOK_SESSIONS/$sid2" ] && echo kept || echo gone)" gone
+check "foreign directory left alone" "$([ -d "$LOOK_SESSIONS/archive-2025" ] && echo kept || echo gone)" kept
+kill $fake2; wait $fake2 $lp 2>/dev/null || true

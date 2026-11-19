@@ -31,10 +31,15 @@ happens"), or run `/look`. In the viewer:
 - `:LookHistory` lists every look and tour, newest first. Enter re-shows one and
   finds the code again if it moved. If the code changed, the note says
   "(code changed)".
+- `:LookComment` (on a line, or `:'<,'>LookComment` on a selection) sends a
+  comment to the Claude session that showed that code (for code no look
+  showed, the session whose look came last). Claude answers in its terminal.
+  If the session is busy, the comment waits and arrives when it is free.
 - `:LookClear` removes highlights.
 
-History is kept in `~/.local/state/look/history.jsonl`. `LOOK_SOCK` (default
-`/tmp/look.sock`) and `LOOK_HISTORY` override the socket and history paths.
+History is kept in `~/.local/state/look/history.jsonl`, and per-session
+comment queues in `~/.local/state/look/sessions/`. `LOOK_SOCK` (default
+`/tmp/look.sock`), `LOOK_HISTORY` and `LOOK_SESSIONS` override those paths.
 
 ## Development
 

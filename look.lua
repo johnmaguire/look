@@ -14,6 +14,23 @@ local st = vim.uv.fs_stat(src)
 M.mtime = ("%d.%09d"):format(st.mtime.sec, st.mtime.nsec)
 M.tour_bufs = prev.tour_bufs or {}
 M.hist_path = prev.hist_path or vim.fn.expand("~/.local/state/look/history.jsonl")
+-- Comments go back to the Claude session that showed the code. Tags come from
+-- look.py: {sid, pid, lstart, dir, label}. file_session: file id -> tag of the
+-- last look showing that file; last: tag of the most recent look from any session.
+M.file_session = prev.file_session or {}
+M.last = prev.last
+M.commenting = prev.commenting
+
+-- One spelling per file, computed here for every look and comment alike: a
+-- symlinked path and its target are the same file to the user. Not the inode:
+-- saving by rename-over gives the file a new one.
+local function file_id(path)
+  return vim.uv.fs_realpath(path) or path
+end
+
+local function retag(file, t)
+  M.file_session[file_id(file)] = t
+end
 
 local HIST_MAX = 200
 local ns_single = api.nvim_create_namespace("look_single")
@@ -188,6 +205,7 @@ local function show_tour(rec, stops, first, list_id)
   local items = {}
   for i, st in ipairs(stops) do
     M.tour_bufs[st.buf] = true
+    retag(rec.stops[st.idx].file, rec.session)
     mark(st.buf, ns_tour, st.s, st.e, ("[%d/%d] %s"):format(i, #stops, st.note))
     items[i] = { bufnr = st.buf, lnum = st.s, end_lnum = st.e, text = st.note, user_data = st.idx }
   end
@@ -278,9 +296,12 @@ function M.show(a)
     s, e = clamp(buf, a.start, a["end"])
   end
   show_single(buf, s, e, a.note)
+  retag(a.file, a.session)
+  M.last = a.session or M.last
   local err = append({
     ts = os.time(),
     kind = "look",
+    session = a.session,
     stops = { { file = a.file, start = s, ["end"] = e, note = a.note, text = s and lines(buf, s, e) or nil } },
   })
   return err and ("ok; history not saved: " .. err) or "ok"
@@ -294,7 +315,8 @@ function M.tour(a)
     saved[i] = { file = st.file, start = s, ["end"] = e, note = st.note, text = lines(buf, s, e) }
     stops[i] = { buf = buf, s = s, e = e, note = st.note, idx = i }
   end
-  local rec = { ts = os.time(), kind = "tour", title = a.title, stops = saved }
+  local rec = { ts = os.time(), kind = "tour", title = a.title, session = a.session, stops = saved }
+  M.last = a.session or M.last
   show_tour(rec, stops)
   local err = append(rec)
   return err and ("ok; history not saved: " .. err) or "ok"
@@ -344,6 +366,87 @@ function M.where()
   return ("%s:%d"):format(name, cur)
 end
 
+-- Comments -------------------------------------------------------------------
+
+-- Same process and start time as when it tagged the look: a reused pid is not
+-- it. Both sides format the start in UTC, so the viewer's time zone can differ.
+local function alive(t)
+  if type(t) ~= "table" or type(t.pid) ~= "number" or type(t.dir) ~= "string"
+    or type(t.lstart) ~= "string" or t.lstart == "" or not vim.uv.fs_stat(t.dir .. "/pending") then
+    return false
+  end
+  local r = vim.system({ "ps", "-o", "lstart=", "-p", tostring(t.pid) }, { env = { LC_ALL = "C", TZ = "UTC" }, text = true }):wait()
+  return vim.trim(r.stdout or "") == t.lstart
+end
+
+local function deliver(c, t)
+  local dir = t.dir
+  local name = ("%d-%d.json"):format(os.time(), vim.uv.hrtime())
+  local tmp = dir .. "/." .. name
+  local f = io.open(tmp, "w")
+  -- Written beside pending/ and renamed in, so the listener never reads half a comment
+  if not (f and f:write(vim.json.encode(c)) and f:close() and os.rename(tmp, dir .. "/pending/" .. name)) then
+    vim.fn.setreg("c", c.text)
+    vim.notify("look: could not queue the comment (text is in register c)", vim.log.levels.ERROR)
+    return
+  end
+  local label = tostring(t.label)
+  vim.notify("look: queued for " .. label)
+  vim.defer_fn(function()
+    if vim.uv.fs_stat(dir .. "/pending/" .. name) then
+      vim.notify("look: " .. label .. " has not picked it up yet - the session is busy or not listening")
+    else
+      vim.notify("look: delivered to " .. label)
+    end
+  end, 1500)
+end
+
+-- :[range]LookComment - everything about the target is fixed before the prompt,
+-- so a look arriving while the user types cannot redirect the comment
+function M.comment(opts)
+  local buf = api.nvim_get_current_buf()
+  if vim.bo[buf].buftype ~= "" or api.nvim_buf_get_name(buf) == "" then
+    vim.notify("look: comment from a file window", vim.log.levels.WARN)
+    return
+  end
+  local file = vim.uv.fs_realpath(api.nvim_buf_get_name(buf)) or api.nvim_buf_get_name(buf)
+  local s, e = opts.line1, opts.line2
+  local code = lines(buf, s, math.min(e, s + 39))
+  local t = M.file_session[file_id(file)]
+  local who = "the session that showed this"
+  if not t then
+    t, who = M.last, "the last session that showed code"
+  end
+  if not t then
+    vim.notify("look: no Claude session has shown code here yet", vim.log.levels.WARN)
+    return
+  end
+  local label = type(t) == "table" and tostring(t.label) or "?"
+  -- Never redirect to another session: the comment is about what this one said
+  if not alive(t) then
+    vim.notify(("look: %s (%s) has ended"):format(who, label), vim.log.levels.WARN)
+    return
+  end
+  -- look.py checks this before sending keys, which would cancel the prompt.
+  -- shortcut: a look whose check ran just before the prompt opened can still
+  -- cancel it (milliseconds); move the check into the same RPC if that bites.
+  M.commenting = true
+  vim.ui.input({ prompt = "comment for " .. label .. ": " }, function(text)
+    -- The module may have been reloaded while the prompt was open
+    _G.Look.commenting = false
+    if not text or text == "" then
+      return
+    end
+    local c = { file = file, start = s, ["end"] = e, code = code, text = text }
+    if not alive(t) then
+      vim.fn.setreg("c", text)
+      vim.notify(("look: %s (%s) ended while you typed; the text is in register c"):format(who, label), vim.log.levels.WARN)
+      return
+    end
+    deliver(c, t)
+  end)
+end
+
 -- Quickfix window --------------------------------------------------------------
 
 local function flag(note, changed)
@@ -370,6 +473,9 @@ local function replay(rec, first, list_id)
       end
     end
     show_tour(rec, stops, pos, list_id)
+    if #stops > 0 then
+      M.last = rec.session or M.last
+    end
     return
   end
   local st = rec.stops[1]
@@ -379,6 +485,8 @@ local function replay(rec, first, list_id)
     return
   end
   show_single(buf, s, e, flag(st.note, changed))
+  retag(st.file, rec.session)
+  M.last = rec.session or M.last
 end
 
 -- <CR> in the quickfix window: look lists replay their saved record, resolved
@@ -463,6 +571,7 @@ api.nvim_create_user_command("LookHistory", function()
   _G.Look.guard(_G.Look.history)
 end, {})
 api.nvim_create_user_command("LookClear", M.clear, {})
+api.nvim_create_user_command("LookComment", function(o) _G.Look.comment(o) end, { range = true })
 
 _G.Look = M
 return M

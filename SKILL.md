@@ -47,6 +47,26 @@ hunk worth discussing, in reading order (caller before callee), not file order.
 When they say "this", "here", or asks about code without naming it, run this
 first. It prints `file:line`, or `file:start-end` for a visual selection.
 
+## Comments from the user
+
+The user can comment on code in the viewer (`:LookComment`, on a line or a
+visual selection); the comment comes back to the session that showed that code,
+or for code no look showed, to the session whose look came last. For that the
+session needs a listener. Only the main conversation runs one: a subagent shares
+the session and its listener would take the user's comments, so a subagent
+never runs `--listen`.
+
+- After your first look or tour in a session (or whenever `look.py` prints
+  "no listener for this session"), start `$L --listen` with the Bash tool's
+  `run_in_background`. Don't start one in a session that never used look.
+- When it exits with `look comment on FILE:START-END:` lines, start a new
+  listener in the background **first**, then answer each comment in chat. Each
+  comment includes the code the user saw; the file may have changed since.
+- "already listening" means one is running: nothing to do. An exit with no
+  output means the session is ending: ignore it.
+- A look that fails with "the user is writing a comment" was not shown: try
+  again in a few seconds; if it still fails, carry on in chat.
+
 ## History
 
 Every look and tour is saved to `~/.local/state/look/history.jsonl` (written
@@ -60,5 +80,5 @@ something shown earlier instead of re-deriving it.
 
 - `$L --clear` removes highlights.
 - If the script fails, mention it once and carry on in chat.
-- `LOOK_SOCK` and `LOOK_HISTORY` override the socket and history file. `test.sh` checks the script against a
+- `LOOK_SOCK`, `LOOK_HISTORY` and `LOOK_SESSIONS` (absolute paths) override the socket, history file and session directory. `test.sh` checks the script against a
   throwaway headless viewer; run it after changing `look.py` or `look.lua`.
